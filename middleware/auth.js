@@ -1,4 +1,3 @@
-// middleware/auth.js
 const jwt = require('jsonwebtoken');
 
 exports.protect = (req, res, next) => {
@@ -17,6 +16,15 @@ exports.protect = (req, res, next) => {
 exports.adminOnly = (req, res, next) => {
   if (req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Hanya admin yang boleh mengakses' });
+  }
+  next();
+};
+
+// Tambahkan Middleware baru untuk Staff (User) dan Admin
+exports.staffAndAdmin = (req, res, next) => {
+  // Staff memiliki hak akses 'user', admin juga diberi izin
+  if (req.user.role !== 'admin' && req.user.role !== 'user') {
+    return res.status(403).json({ error: 'Akses ditolak. Anda tidak memiliki izin.' });
   }
   next();
 };
