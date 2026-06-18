@@ -4,8 +4,13 @@ const bcrypt = require('bcryptjs');
 
 const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true },
+  email: { type: String, required: true, unique: true }, // Tambahan
   password: { type: String, required: true },
   role: { type: String, enum: ['admin', 'user'], default: 'user' },
+  isEmailVerified: { type: Boolean, default: false }, // Tambahan
+  verificationToken: { type: String }, // Tambahan
+  resetPasswordToken: { type: String }, // Tambahan
+  resetPasswordExpires: { type: Date } // Tambahan
 });
 
 userSchema.pre('save', async function (next) {
