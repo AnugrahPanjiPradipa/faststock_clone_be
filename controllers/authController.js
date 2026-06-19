@@ -21,8 +21,8 @@ exports.register = async (req, res) => {
 
     await user.save();
 
-    // URL yang mengarah ke backend untuk verifikasi
-    const verificationUrl = `${req.protocol}://${req.get("host")}/api/auth/verifyemail/${verificationToken}`;
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    const verificationUrl = `${frontendUrl}/verify-email?token=${verificationToken}`;
 
     const message = `Halo ${username},\n\nTerima kasih telah mendaftar. Silakan klik link berikut untuk memverifikasi email kamu:\n\n${verificationUrl}`;
 
@@ -32,11 +32,9 @@ exports.register = async (req, res) => {
         subject: "Verifikasi Email FastStock",
         message,
       });
-      res
-        .status(201)
-        .json({
-          message: "User terdaftar. Silakan cek email kamu untuk verifikasi.",
-        });
+      res.status(201).json({
+        message: "User terdaftar. Silakan cek email kamu untuk verifikasi.",
+      });
     } catch (err) {
       user.verificationToken = undefined;
       await user.save();
@@ -78,11 +76,9 @@ exports.login = async (req, res) => {
 
     // Cek apakah email sudah diverifikasi
     if (!user.isEmailVerified) {
-      return res
-        .status(401)
-        .json({
-          error: "Email belum diverifikasi. Silakan cek inbox email kamu.",
-        });
+      return res.status(401).json({
+        error: "Email belum diverifikasi. Silakan cek inbox email kamu.",
+      });
     }
 
     const isMatch = await user.comparePassword(password);
