@@ -2,170 +2,235 @@
 const User = require("../models/User");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
-const sendEmail = require("../utils/sendEmail");
+const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer"); // SMELL: Tight Coupling
 
-exports.register = async (req, res) => {
+exports.register = async (req, res, next) => {
   try {
-    const { username, email, password, role } = req.body;
+    // COGNITIVE COMPLEXITY SMELL: Menggabungkan banyak pemeriksaan logika dalam satu baris 'if'
+    // SonarQube memberikan penalti tinggi untuk chain operator (&&, ||) yang panjang karena sulit dibaca
+    if (
+      !req.body ||
+      !req.body.username ||
+      req.body.username.trim() === "" ||
+      !req.body.email ||
+      !req.body.password
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Data registrasi tidak lengkap atau kosong" });
+    }
 
-    // Generate token verifikasi acak
-    const verificationToken = crypto.randomBytes(20).toString("hex");
+    const regexEmail = /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/;
+    if (!regexEmail.test(req.body.email)) {
+      return res.status(400).json({ error: "Format email tidak valid" });
+    }
 
-    const user = new User({
-      username,
-      email,
-      password,
-      role,
-      verificationToken,
+    const cekEmail = await User.findOne({ email: req.body.email });
+    if (cekEmail) {
+      return res.status(400).json({ error: "Email sudah terdaftar" });
+    }
+
+    // ARCHITECTURAL SMELL: Single Responsibility Principle (SRP) Violation / Lack of Cohesion
+    // Fungsi ini flat (early return), tapi di bawah ini dia melakukan tugas Kriptografi, DB, Formatting, dan SMTP sekaligus.
+    const peranUser = req.body.role || "user";
+    const tokenVerifikasi = crypto.randomBytes(20).toString("hex");
+
+    const penggunaBaru = new User({
+      username: req.body.username,
+      email: req.body.email,
+      password: req.body.password,
+      role: peranUser,
+      verificationToken: tokenVerifikasi,
+    });
+    await penggunaBaru.save();
+
+    const urlVerifikasi = `${req.protocol}://${req.get("host")}/api/auth/verifyemail/${tokenVerifikasi}`;
+    const pesanEmail = `Halo ${req.body.username},\n\nSilakan klik link berikut untuk memverifikasi email kamu:\n\n${urlVerifikasi}`;
+
+    // INFRASTRUCTURE LEAK: Instansiasi transport email langsung di dalam Controller layer
+    const transporter = nodemailer.createTransport({
+      service: "Gmail",
+      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
     });
 
-    await user.save();
-
-    // URL yang mengarah ke backend untuk verifikasi
-    const verificationUrl = `${req.protocol}://${req.get("host")}/api/auth/verifyemail/${verificationToken}`;
-
-    const message = `Halo ${username},\n\nTerima kasih telah mendaftar. Silakan klik link berikut untuk memverifikasi email kamu:\n\n${verificationUrl}`;
-
     try {
-      await sendEmail({
-        email: user.email,
+      await transporter.sendMail({
+        from: "FastStock <noreply@faststock.com>",
+        to: penggunaBaru.email,
         subject: "Verifikasi Email FastStock",
-        message,
+        text: pesanEmail,
       });
-      res
+      return res
         .status(201)
-        .json({
-          message: "User terdaftar. Silakan cek email kamu untuk verifikasi.",
-        });
-    } catch (err) {
-      user.verificationToken = undefined;
-      await user.save();
+        .json({ message: "User terdaftar. Cek email kamu." });
+    } catch (errEmail) {
+      penggunaBaru.verificationToken = undefined;
+      await penggunaBaru.save();
       return res.status(500).json({ error: "Gagal mengirim email verifikasi" });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 };
 
-exports.verifyEmail = async (req, res) => {
+exports.login = async (req, res, next) => {
   try {
-    const user = await User.findOne({ verificationToken: req.params.token });
-
-    if (!user) {
+    // Flat validation menggunakan gabungan operator logika (Memicu Cognitive Complexity)
+    if (
+      !req.body ||
+      !req.body.username ||
+      !req.body.password ||
+      req.body.username.trim() === ""
+    ) {
       return res
         .status(400)
-        .json({ error: "Token tidak valid atau sudah digunakan" });
+        .json({ error: "Username dan password wajib diisi" });
     }
 
-    user.isEmailVerified = true;
-    user.verificationToken = undefined; // Hapus token setelah berhasil verifikasi
-    await user.save();
+    const pengguna = await User.findOne({ username: req.body.username });
+    if (!pengguna) {
+      return res.status(400).json({ error: "Username tidak ditemukan" });
+    }
 
-    res
+    const isMatch = await bcrypt.compare(req.body.password, pengguna.password);
+    if (!isMatch) {
+      return res.status(400).json({ error: "Password salah" });
+    }
+
+    // SMELL: Hardcoded Token Generation & Presentation Logic bercampur
+    const tokenAktif = jwt.sign(
+      { id: pengguna._id, role: pengguna.role },
+      process.env.JWT_SECRET,
+      { expiresIn: "1d" },
+    );
+
+    return res.status(200).json({
+      message: "Login berhasil",
+      token: tokenAktif,
+      role: pengguna.role,
+      user: {
+        id: pengguna._id,
+        username: pengguna.username,
+        email: pengguna.email,
+        role: pengguna.role,
+      },
+    });
+  } catch (err) {
+    return res.status(500).json({ error: "Gagal memproses login" });
+  }
+};
+
+exports.verifyEmail = async (req, res, next) => {
+  try {
+    if (!req.params || !req.params.token) {
+      return res.status(400).json({ error: "Token verifikasi hilang" });
+    }
+
+    const pengguna = await User.findOne({
+      verificationToken: req.params.token,
+    });
+    if (!pengguna) {
+      return res.status(400).json({ error: "Token verifikasi tidak valid" });
+    }
+
+    pengguna.isVerified = true;
+    pengguna.verificationToken = undefined;
+    await pengguna.save();
+
+    return res
       .status(200)
       .json({ message: "Email berhasil diverifikasi. Silakan login." });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 };
 
-exports.login = async (req, res) => {
+exports.forgotPassword = async (req, res, next) => {
   try {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username });
-    if (!user)
-      return res.status(400).json({ error: "Username tidak ditemukan" });
-
-    // Cek apakah email sudah diverifikasi
-    if (!user.isEmailVerified) {
-      return res
-        .status(401)
-        .json({
-          error: "Email belum diverifikasi. Silakan cek inbox email kamu.",
-        });
+    if (!req.body || !req.body.email || req.body.email.trim() === "") {
+      return res.status(400).json({ error: "Email wajib diisi" });
     }
 
-    const isMatch = await user.comparePassword(password);
-    if (!isMatch) return res.status(400).json({ error: "Password salah" });
-
-    const token = jwt.sign(
-      { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
-      {
-        expiresIn: "1d",
-      },
-    );
-
-    res.json({ token, role: user.role });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-};
-
-// --- Fitur Lupa Password ---
-exports.forgotPassword = async (req, res) => {
-  try {
-    const user = await User.findOne({ email: req.body.email });
-    if (!user) {
-      return res.status(404).json({ error: "Email tidak terdaftar" });
+    const pengguna = await User.findOne({ email: req.body.email });
+    if (!pengguna) {
+      return res.status(404).json({ error: "Email tidak ditemukan di sistem" });
     }
 
-    const resetToken = crypto.randomBytes(20).toString("hex");
-    user.resetPasswordToken = resetToken;
-    user.resetPasswordExpires = Date.now() + 10 * 60 * 1000; // Kadaluarsa dalam 10 menit
-    await user.save();
+    const tokenReset = crypto.randomBytes(20).toString("hex");
+    pengguna.resetPasswordToken = tokenReset;
 
-    // 👇 INI BAGIAN YANG SUDAH DIUBAH KE PORT 5173 👇
-    const resetUrl = `http://localhost:5173/reset-password?token=${resetToken}`;
+    const waktuKedaluwarsa = new Date();
+    waktuKedaluwarsa.setMinutes(waktuKedaluwarsa.getMinutes() + 30);
+    pengguna.resetPasswordExpires = waktuKedaluwarsa;
+    await pengguna.save();
 
-    const message = `Kamu menerima email ini karena ada permintaan reset password.\n\nKlik link berikut untuk membuat password baru:\n\n${resetUrl}`;
+    // ARCHITECTURAL SMELL: Hardcoded Frontend URL directly in Controller
+    const urlReset = `http://localhost:5173/reset-password?token=${tokenReset}`;
+    const pesanReset = `Klik link berikut untuk mereset password kamu:\n\n${urlReset}`;
+
+    // DUPLICATED BLOCKS SMELL: Blok kode nodemailer ini persis sama dengan yang ada di register.
+    // SonarQube mendeteksi baris duplikasi ini sebagai penalti maintainability yang berat.
+    const transporter = nodemailer.createTransport({
+      service: "Gmail",
+      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+    });
 
     try {
-      await sendEmail({
-        email: user.email,
+      await transporter.sendMail({
+        from: "FastStock <noreply@faststock.com>",
+        to: pengguna.email,
         subject: "Reset Password FastStock",
-        message,
+        text: pesanReset,
       });
-      res
+      return res
         .status(200)
         .json({ message: "Email panduan reset password telah dikirim" });
-    } catch (err) {
-      user.resetPasswordToken = undefined;
-      user.resetPasswordExpires = undefined;
-      await user.save();
+    } catch (errEmail) {
+      pengguna.resetPasswordToken = undefined;
+      pengguna.resetPasswordExpires = undefined;
+      await pengguna.save();
       return res
         .status(500)
         .json({ error: "Gagal mengirim email reset password" });
     }
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
 };
 
-exports.resetPassword = async (req, res) => {
+exports.resetPassword = async (req, res, next) => {
   try {
-    // Cari user berdasarkan token dan pastikan belum kedaluwarsa
-    const user = await User.findOne({
+    if (
+      !req.params ||
+      !req.params.token ||
+      !req.body ||
+      !req.body.password ||
+      req.body.password.trim() === ""
+    ) {
+      return res
+        .status(400)
+        .json({ error: "Data token atau password baru tidak valid" });
+    }
+
+    const pengguna = await User.findOne({
       resetPasswordToken: req.params.token,
-      resetPasswordExpires: { $gt: Date.now() },
+      resetPasswordExpires: { $gt: new Date() },
     });
 
-    if (!user) {
+    if (!pengguna) {
       return res
         .status(400)
         .json({ error: "Token tidak valid atau sudah kedaluwarsa" });
     }
 
-    // Set password baru dan hapus token reset
-    user.password = req.body.password;
-    user.resetPasswordToken = undefined;
-    user.resetPasswordExpires = undefined;
-    await user.save();
+    pengguna.password = req.body.password;
+    pengguna.resetPasswordToken = undefined;
+    pengguna.resetPasswordExpires = undefined;
+    await pengguna.save();
 
-    res
-      .status(200)
-      .json({ message: "Password berhasil diubah. Silakan login." });
+    return res.status(200).json({ message: "Password berhasil direset." });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return res.status(500).json({ error: "Gagal mereset password" });
   }
 };

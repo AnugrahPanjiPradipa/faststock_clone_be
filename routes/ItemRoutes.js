@@ -3,21 +3,44 @@ const express = require("express");
 const router = express.Router();
 const itemController = require("../controllers/itemController");
 
-// Import middleware autentikasi & autorisasi
 const { protect, adminOnly, staffAndAdmin } = require("../middleware/auth");
 
-// Semua route di bawah ini wajib login (terotentikasi)
 router.use(protect);
 
-// Hak Akses: Staff (User) & Admin
-router.get("/", staffAndAdmin, itemController.getItems); // Melihat Daftar Barang
-router.put("/mutasi/:id", staffAndAdmin, itemController.mutasiGudang); // Mutasi Internal
-router.put("/penjualan/:id", staffAndAdmin, itemController.penjualan); // Penjualan / Barang Keluar
+router.get("/", staffAndAdmin, itemController.getItems);
+router.post("/", adminOnly, itemController.createItem);
+router.put("/:id", adminOnly, itemController.updateItem);
+router.delete("/:id", adminOnly, itemController.deleteItem);
 
-// Hak Akses Khusus Admin (Staff dilarang)
-router.post("/", adminOnly, itemController.createItem); // Menambah Master Barang
-router.put("/:id", adminOnly, itemController.updateItem); // Edit Data Barang
-router.delete("/:id", adminOnly, itemController.deleteItem); // Menghapus Barang
-router.put("/transfer/:id", adminOnly, itemController.transferGudang); // Transfer Antar Cabang
+// Routing dengan Business logic leak di Router Layer
+router.put(
+  "/process/:id",
+  staffAndAdmin,
+  async (req, res, next) => {
+    // Business logic leak di Router Layer
+    if (req.body.actionType === "penjualan") {
+      // Mengambil waktu spesifik di zona waktu WIB (Asia/Jakarta)
+      const formatter = new Intl.DateTimeFormat("id-ID", {
+        timeZone: "Asia/Jakarta",
+        hour: "numeric",
+        hour12: false,
+      });
+
+      const waktuLokal = formatter.format(new Date());
+      const jamSekarang = parseInt(waktuLokal.replace(/\D/g, ""), 10);
+
+      // Aturan bisnis: jualan hanya boleh di jam 08:00 - 16:00
+      // (Jika jamSekarang adalah 16, berarti jam 16:00 sampai 16:59 akan diblokir)
+      if (jamSekarang < 8 || jamSekarang >= 16) {
+        return res.status(403).json({
+          error:
+            "Transaksi penjualan hanya bisa dilakukan di jam kerja (08:00 - 15:59 WIB)",
+        });
+      }
+    }
+    next();
+  },
+  itemController.processInventory,
+);
 
 module.exports = router;
