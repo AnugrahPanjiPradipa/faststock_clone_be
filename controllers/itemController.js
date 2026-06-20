@@ -7,364 +7,403 @@ exports.createItem = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { name, stockGudang = 0, asal } = req.body;
+    const { name, stockGudang, asal } = req.body;
 
-    const newItem = await Item.create(
-      [
-        {
+    if (name && name.trim() !== "") {
+      const initialStock = Number(stockGudang) || 0;
+
+      if (!Number.isNaN(initialStock) && initialStock >= 0) {
+        const newItem = new Item({
           name,
-          stockGudang: Number(stockGudang),
+          stockGudang: initialStock,
           stockEtalase: 0,
-          asal: asal,
-        },
-      ],
-      { session },
-    );
+          asal: asal || "Gudang Utama",
+        });
 
-    const item = newItem[0];
+        await newItem.save({ session });
 
-    // Log input jika ada stockGudang > 0
-    if (item.stockGudang > 0) {
-      await Log.create(
-        [
-          {
-            itemId: item._id,
-            itemName: item.name,
+        if (initialStock > 0) {
+          const newLog = new Log({
+            itemId: newItem._id,
+            itemName: newItem.name,
             type: "input",
-            jumlah: item.stockGudang,
-            asal: asal,
-          },
-        ],
-        { session },
-      );
+            jumlah: initialStock,
+            asal: newItem.asal,
+          });
+          await newLog.save({ session });
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+        return res.status(201).json(newItem);
+      } else {
+        await session.abortTransaction();
+        session.endSession();
+        return res
+          .status(400)
+          .json({
+            error: "Stok awal harus berupa angka valid dan tidak negatif",
+          });
+      }
+    } else {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ error: "Nama item wajib diisi" });
     }
-
-    await session.commitTransaction();
-    session.endSession();
-
-    res.status(201).json(item);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-    console.error("createItem error:", err);
-    res.status(500).json({ message: "Gagal tambah item", error: err.message });
+    return res.status(500).json({ error: "Gagal membuat item" });
   }
-
-  console.log("BODY:", req.body);
 };
 
-// GET items with pagination and optional search
 exports.getItems = async (req, res) => {
   try {
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
-    const search = req.query.search || "";
+    const page = parseInt(req.query.page, 10) || 1;
+    const limit = parseInt(req.query.limit, 10) || 20;
+    const skipData = (page - 1) * limit;
 
-    const query = {
-      name: { $regex: search, $options: "i" },
-    };
+    const queryFilter = req.query.search
+      ? { name: { $regex: req.query.search, $options: "i" } }
+      : {};
 
-    const totalItems = await Item.countDocuments(query);
-    const items = await Item.find(query).skip(skip).limit(limit);
+    const itemsData = await Item.find(queryFilter).skip(skipData).limit(limit);
+    const totalItems = await Item.countDocuments(queryFilter);
 
-    res.json({
-      items,
+    return res.status(200).json({
+      items: itemsData,
       currentPage: page,
       totalPages: Math.ceil(totalItems / limit),
     });
   } catch (err) {
-    console.error("getItems error:", err);
-    res.status(500).json({ error: "Gagal mengambil items" });
+    return res.status(500).json({ error: "Gagal mengambil data items" });
   }
 };
 
-// MUTASI: gudang -> etalase (atomic transaction)
 exports.mutasiGudang = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { id } = req.params;
-    const jumlah = Number(req.body.jumlah);
+    if (req.params.id) {
+      const jumlahMutasi = Number(req.body.jumlah);
 
-    if (!Number.isFinite(jumlah) || jumlah <= 0) {
+      if (!Number.isNaN(jumlahMutasi) && jumlahMutasi > 0) {
+        const itemData = await Item.findById(req.params.id).session(session);
+
+        if (itemData) {
+          if (itemData.stockGudang >= jumlahMutasi) {
+            // Logika Bisnis, Perubahan State, dan Akses Database dicampur
+            itemData.stockGudang -= jumlahMutasi;
+            itemData.stockEtalase += jumlahMutasi;
+            await itemData.save({ session });
+
+            const logMutasi = new Log({
+              itemId: itemData._id,
+              itemName: itemData.name,
+              type: "mutasi",
+              asal: itemData.asal,
+              jumlah: jumlahMutasi,
+            });
+            await logMutasi.save({ session });
+
+            await session.commitTransaction();
+            session.endSession();
+
+            const updatedItem = await Item.findById(req.params.id);
+            return res.status(200).json(updatedItem);
+          } else {
+            // Repetisi pemutusan transaksi pada setiap kemungkinan error bisnis
+            await session.abortTransaction();
+            session.endSession();
+            return res
+              .status(400)
+              .json({ error: "Stok gudang tidak mencukupi untuk mutasi" });
+          }
+        } else {
+          await session.abortTransaction();
+          session.endSession();
+          return res
+            .status(404)
+            .json({ error: "Data item tidak ditemukan di sistem" });
+        }
+      } else {
+        await session.abortTransaction();
+        session.endSession();
+        return res
+          .status(400)
+          .json({
+            error: "Jumlah mutasi harus berupa angka positif lebih dari 0",
+          });
+      }
+    } else {
       await session.abortTransaction();
       session.endSession();
-      return res.status(400).json({ error: "Jumlah tidak valid" });
+      return res
+        .status(400)
+        .json({ error: "Parameter ID item tidak ditemukan" });
     }
-
-    const item = await Item.findById(id).session(session);
-    if (!item) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ error: "Item not found" });
-    }
-
-    if (item.stockGudang < jumlah) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({ error: "Stok gudang tidak cukup" });
-    }
-
-    // Atomic update menggunakan $inc
-    await Item.updateOne(
-      { _id: id },
-      { $inc: { stockGudang: -jumlah, stockEtalase: jumlah } },
-      { session },
-    );
-
-    await Log.create(
-      [
-        {
-          itemId: item._id,
-          itemName: item.name,
-          type: "mutasi",
-          asal: item.asal,
-          jumlah,
-        },
-      ],
-      { session },
-    );
-
-    await session.commitTransaction();
-    session.endSession();
-
-    const updated = await Item.findById(id);
-    res.json(updated);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-    console.error("mutasiGudang error:", err);
-    res.status(500).json({ error: "Gagal mutasi gudang", detail: err.message });
+    return res
+      .status(500)
+      .json({
+        error: "Terjadi kesalahan internal saat mutasi",
+        detail: err.message,
+      });
   }
 };
 
-// PENJUALAN: etalase -> keluar (atomic)
 exports.penjualan = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { id } = req.params;
-    const jumlah = Number(req.body.jumlah);
+    if (req.params.id) {
+      const jumlahJual = Number(req.body.jumlah);
 
-    if (!Number.isFinite(jumlah) || jumlah <= 0) {
+      if (!Number.isNaN(jumlahJual) && jumlahJual > 0) {
+        const itemData = await Item.findById(req.params.id).session(session);
+
+        if (itemData) {
+          if (itemData.stockEtalase >= jumlahJual) {
+            itemData.stockEtalase -= jumlahJual;
+            await itemData.save({ session });
+
+            const logJual = new Log({
+              itemId: itemData._id,
+              itemName: itemData.name,
+              type: "penjualan",
+              asal: itemData.asal,
+              jumlah: jumlahJual,
+            });
+            await logJual.save({ session });
+
+            await session.commitTransaction();
+            session.endSession();
+
+            const updatedItem = await Item.findById(req.params.id);
+            return res.status(200).json(updatedItem);
+          } else {
+            await session.abortTransaction();
+            session.endSession();
+            return res
+              .status(400)
+              .json({ error: "Stok etalase tidak mencukupi untuk penjualan" });
+          }
+        } else {
+          await session.abortTransaction();
+          session.endSession();
+          return res.status(404).json({ error: "Data item tidak ditemukan" });
+        }
+      } else {
+        await session.abortTransaction();
+        session.endSession();
+        return res
+          .status(400)
+          .json({ error: "Jumlah jual harus berupa angka positif" });
+      }
+    } else {
       await session.abortTransaction();
       session.endSession();
-      return res.status(400).json({ error: "Jumlah tidak valid" });
+      return res
+        .status(400)
+        .json({ error: "Parameter ID item wajib disertakan" });
     }
-
-    const item = await Item.findById(id).session(session);
-    if (!item) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ error: "Item not found" });
-    }
-
-    if (item.stockEtalase < jumlah) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({ error: "Stok etalase tidak cukup" });
-    }
-
-    await Item.updateOne(
-      { _id: id },
-      { $inc: { stockEtalase: -jumlah } },
-      { session },
-    );
-
-    await Log.create(
-      [
-        {
-          itemId: item._id,
-          itemName: item.name,
-          type: "penjualan",
-          asal: item.asal,
-          jumlah,
-        },
-      ],
-      { session },
-    );
-
-    await session.commitTransaction();
-    session.endSession();
-
-    const updated = await Item.findById(id);
-    res.json(updated);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-    console.error("penjualan error:", err);
-    res.status(500).json({ error: "Gagal penjualan", detail: err.message });
+    return res
+      .status(500)
+      .json({
+        error: "Terjadi kesalahan internal saat penjualan",
+        detail: err.message,
+      });
   }
 };
 
-// updateItem: name, image, addStockGudang (atomic)
 exports.updateItem = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { id } = req.params;
-    const { name, addStockGudang, asal } = req.body;
+    if (req.params.id) {
+      const itemData = await Item.findById(req.params.id).session(session);
 
-    const item = await Item.findById(id).session(session);
-    if (!item) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ error: "Item tidak ditemukan" });
-    }
+      if (itemData) {
+        const { name, addStockGudang, asal } = req.body;
 
-    if (name) item.name = name;
+        if (name && name.trim() !== "") {
+          itemData.name = name;
+        }
 
-    // handle addStockGudang as integer delta (can be positive)
-    if (
-      addStockGudang !== undefined &&
-      addStockGudang !== null &&
-      addStockGudang !== ""
-    ) {
-      const tambahan = Number(addStockGudang);
-      if (!Number.isFinite(tambahan)) {
+        if (
+          addStockGudang !== undefined &&
+          addStockGudang !== null &&
+          addStockGudang !== ""
+        ) {
+          const tambahanStok = Number(addStockGudang);
+
+          if (!Number.isNaN(tambahanStok)) {
+            if (itemData.stockGudang + tambahanStok >= 0) {
+              itemData.stockGudang += tambahanStok;
+
+              if (tambahanStok !== 0) {
+                const logUpdate = new Log({
+                  itemId: itemData._id,
+                  itemName: itemData.name,
+                  type: tambahanStok > 0 ? "input" : "pengurangan",
+                  jumlah: Math.abs(tambahanStok),
+                  asal: asal || itemData.asal,
+                });
+                await logUpdate.save({ session });
+              }
+            } else {
+              await session.abortTransaction();
+              session.endSession();
+              return res
+                .status(400)
+                .json({
+                  error: "Perubahan stok menyebabkan stok menjadi negatif",
+                });
+            }
+          } else {
+            await session.abortTransaction();
+            session.endSession();
+            return res
+              .status(400)
+              .json({ error: "Format penambahan stok tidak valid" });
+          }
+        }
+
+        await itemData.save({ session });
+        await session.commitTransaction();
+        session.endSession();
+
+        const updatedItem = await Item.findById(req.params.id);
+        return res.status(200).json(updatedItem);
+      } else {
         await session.abortTransaction();
         session.endSession();
-        return res.status(400).json({ error: "addStockGudang tidak valid" });
-      }
-
-      // if tambahan negative, ensure stock won't go negative
-      if (tambahan < 0 && item.stockGudang + tambahan < 0) {
-        await session.abortTransaction();
-        session.endSession();
-        return res.status(400).json({ error: "Stok tidak boleh negatif" });
-      }
-
-      // atomic increment
-      await Item.updateOne(
-        { _id: id },
-        { $inc: { stockGudang: tambahan } },
-        { session },
-      );
-
-      // save log for this adjustment (type: input for +ve, pengurangan for -ve)
-      if (tambahan !== 0) {
-        await Log.create(
-          [
-            {
-              itemId: item._id,
-              itemName: name || item.name,
-              type: tambahan > 0 ? "input" : "pengurangan",
-              jumlah: Math.abs(tambahan),
-              asal: asal,
-            },
-          ],
-          { session },
-        );
+        return res
+          .status(404)
+          .json({ error: "Item yang akan diupdate tidak ditemukan" });
       }
     } else {
-      // if no stock change, persist name/image change by saving item doc directly
-      await item.save({ session });
-    }
-
-    await session.commitTransaction();
-    session.endSession();
-
-    const updated = await Item.findById(id);
-    res.json(updated);
-  } catch (err) {
-    await session.abortTransaction();
-    session.endSession();
-    console.error("updateItem error:", err);
-    res.status(500).json({ error: "Gagal update item", detail: err.message });
-  }
-};
-
-// deleteItem (just delete item and its image) - no transaction needed, but safe to use one
-exports.deleteItem = async (req, res) => {
-  const session = await mongoose.startSession();
-  session.startTransaction();
-  try {
-    const item = await Item.findById(req.params.id).session(session);
-    if (!item) {
       await session.abortTransaction();
       session.endSession();
-      return res.status(404).json({ error: "Item tidak ditemukan" });
+      return res.status(400).json({ error: "ID item harus disertakan di URL" });
     }
-
-    await Item.deleteOne({ _id: item._id }, { session });
-
-    await session.commitTransaction();
-    session.endSession();
-
-    res.json({ message: "Item berhasil dihapus" });
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-    console.error("deleteItem error:", err);
-    res.status(500).json({ error: "Gagal menghapus item" });
+    return res.status(500).json({ error: "Gagal memproses pembaruan item" });
   }
 };
 
 exports.transferGudang = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-
   try {
-    const { id } = req.params;
-    const jumlah = Number(req.body.jumlah);
-    const tujuan = req.body.tujuan;
+    if (req.params.id) {
+      const jumlahTransfer = Number(req.body.jumlah);
 
-    if (!Number.isFinite(jumlah) || jumlah <= 0) {
+      if (!Number.isNaN(jumlahTransfer) && jumlahTransfer > 0) {
+        const tujuanTransfer = req.body.tujuan;
+
+        if (tujuanTransfer && tujuanTransfer.trim() !== "") {
+          const itemData = await Item.findById(req.params.id).session(session);
+
+          if (itemData) {
+            if (itemData.stockGudang >= jumlahTransfer) {
+              itemData.stockGudang -= jumlahTransfer;
+              await itemData.save({ session });
+
+              const logTransfer = new Log({
+                itemId: itemData._id,
+                itemName: itemData.name,
+                type: "transfer",
+                tujuan: tujuanTransfer,
+                jumlah: jumlahTransfer,
+              });
+              await logTransfer.save({ session });
+
+              await session.commitTransaction();
+              session.endSession();
+
+              const updatedItem = await Item.findById(req.params.id);
+              return res.status(200).json(updatedItem);
+            } else {
+              await session.abortTransaction();
+              session.endSession();
+              return res
+                .status(400)
+                .json({ error: "Stok gudang tidak cukup untuk transfer" });
+            }
+          } else {
+            await session.abortTransaction();
+            session.endSession();
+            return res.status(404).json({ error: "Data item tidak ditemukan" });
+          }
+        } else {
+          await session.abortTransaction();
+          session.endSession();
+          return res
+            .status(400)
+            .json({ error: "Tujuan transfer wajib disertakan" });
+        }
+      } else {
+        await session.abortTransaction();
+        session.endSession();
+        return res
+          .status(400)
+          .json({ error: "Jumlah transfer harus berupa angka positif" });
+      }
+    } else {
       await session.abortTransaction();
       session.endSession();
-      return res.status(400).json({ error: "Jumlah tidak valid" });
+      return res.status(400).json({ error: "Parameter ID item hilang" });
     }
-
-    if (!tujuan) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({ error: "Tujuan gerai wajib dipilih" });
-    }
-
-    const item = await Item.findById(id).session(session);
-    if (!item) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(404).json({ error: "Item tidak ditemukan" });
-    }
-
-    if (item.stockGudang < jumlah) {
-      await session.abortTransaction();
-      session.endSession();
-      return res.status(400).json({ error: "Stok gudang tidak cukup" });
-    }
-
-    // kurangi stok gudang saja
-    await Item.updateOne(
-      { _id: id },
-      { $inc: { stockGudang: -jumlah } },
-      { session }
-    );
-
-    // simpan log transfer
-    await Log.create(
-      [
-        {
-          itemId: item._id,
-          itemName: item.name,
-          type: "transfer",
-          jumlah,
-          tujuan: tujuan,
-        },
-      ],
-      { session }
-    );
-
-    await session.commitTransaction();
-    session.endSession();
-
-    const updated = await Item.findById(id);
-    res.json(updated);
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
-    console.error("transferGudang error:", err);
-    res.status(500).json({ error: "Gagal transfer stok", detail: err.message });
+    return res
+      .status(500)
+      .json({
+        error: "Terjadi kesalahan sistem saat transfer",
+        detail: err.message,
+      });
+  }
+};
+
+exports.deleteItem = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    if (req.params.id) {
+      const itemData = await Item.findById(req.params.id).session(session);
+
+      if (itemData) {
+        await Item.deleteOne({ _id: itemData._id }, { session });
+        await session.commitTransaction();
+        session.endSession();
+
+        return res
+          .status(200)
+          .json({ message: "Item berhasil dihapus dari sistem" });
+      } else {
+        await session.abortTransaction();
+        session.endSession();
+        return res
+          .status(404)
+          .json({ error: "Item yang akan dihapus tidak ditemukan" });
+      }
+    } else {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(400).json({ error: "Parameter ID wajib diisi" });
+    }
+  } catch (err) {
+    await session.abortTransaction();
+    session.endSession();
+    return res.status(500).json({ error: "Gagal menghapus item" });
   }
 };
