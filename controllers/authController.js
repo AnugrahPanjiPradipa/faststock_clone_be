@@ -166,7 +166,7 @@ exports.forgotPassword = async (req, res, next) => {
     await pengguna.save();
 
     // ARCHITECTURAL SMELL: Hardcoded Frontend URL directly in Controller
-    const urlReset = `http://localhost:5173/reset-password?token=${tokenReset}`;
+    const urlReset = `https://faststockfeclone.netlify.app/reset-password?token=${tokenReset}`;
     const pesanReset = `Klik link berikut untuk mereset password kamu:\n\n${urlReset}`;
 
     // DUPLICATED BLOCKS SMELL: Blok kode nodemailer ini persis sama dengan yang ada di register.
